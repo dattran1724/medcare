@@ -1,0 +1,55 @@
+{
+  "patient_info": {
+    "age": null,
+    "sex": null,
+    "pregnancy_status": null
+  },
+  "medical_history": {
+    "conditions": [],
+    "surgical_history": [],
+    "current_medications": [],
+    "allergies": [],
+    "family_history": []
+  },
+  "current_case_id": null,
+  "cases": [
+    {
+      "case_id": "case_001",
+      "chief_complaint": null,
+      "status": "ACTIVE",
+      "response_mode": "AI_ACTIVE",
+      "present_illness": {
+        "onset": null,
+        "duration": null,
+        "episode_duration": null,
+        "frequency": null,
+        "course": null,
+        "location": null,
+        "character": null,
+        "severity": null,
+        "associated_symptoms": [],
+        "aggravating_factors": [],
+        "relieving_factors": []
+      },
+      "clinical_data": {
+        "vitals": {},
+        "lab_results": [],
+        "imaging": [],
+        "other": []
+      },
+      "progress_history": [],
+      "risk_assessment": {
+        "level": "NOT_ASSESSED",
+        "danger_signs": [],
+        "requires_emergency_care": false,
+        "requires_in_person_evaluation": false
+      },
+      "missing_information": [],
+      "workflow": {
+        "status": "COLLECTING",
+        "next_action": null
+      },
+      "doctor_handoff": null
+    }
+  ]
+}

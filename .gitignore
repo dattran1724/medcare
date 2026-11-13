@@ -3,3 +3,5 @@ Dataset/
 __pycache__/
 catboost_info/
 models/
+.env
+.env.example
