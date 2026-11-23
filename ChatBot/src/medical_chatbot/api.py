@@ -1,4 +1,4 @@
-"""Local test API with SQLite persistence; no patient authentication."""
+"""Local test API with Atlas or SQLite persistence; no patient authentication."""
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 import os
@@ -10,7 +10,7 @@ from pydantic import Field, ValidationError
 from medical_chatbot.schemas.base import NonEmpty, Schema
 from medical_chatbot.schemas.conversation import Conversation, Message
 from medical_chatbot.agents.intake.graph import IntakeSession, TurnResult, build_intake_graph, run_turn, retry_question
-from medical_chatbot.storage import LocalStore
+from medical_chatbot.storage import create_store, StorageError, StorageConflict
 
 
 class CreateConversation(Schema):
@@ -26,12 +26,14 @@ class RetryMessage(Schema):
     retry_id: NonEmpty
 
 
-def create_app(graph=None, *, database_path: str | None = None) -> FastAPI:
-    store = LocalStore(database_path or os.getenv("MEDCARE_DB_PATH") or "agent1.sqlite3")
+def create_app(graph=None, *, database_path: str | None = None, storage=None) -> FastAPI:
+    store = storage if storage is not None else create_store(database_path)
 
     @asynccontextmanager
     async def lifespan(app):
         try:
+            if hasattr(store, "initialize"):
+                store.initialize()
             yield
         finally:
             store.close()
@@ -41,8 +43,13 @@ def create_app(graph=None, *, database_path: str | None = None) -> FastAPI:
 
     @app.exception_handler(sqlite3.DatabaseError)
     @app.exception_handler(ValidationError)
+    @app.exception_handler(StorageError)
     async def storage_error(request, error):
         return JSONResponse(status_code=503, content={"detail": "Stored session unavailable or storage is busy"})
+
+    @app.exception_handler(StorageConflict)
+    async def concurrent_update(request, error):
+        return JSONResponse(status_code=409, content={"detail": "Session changed during processing; reload before retrying"})
 
     def load_session(conversation_id):
         data = store.get("sessions", conversation_id)
@@ -56,7 +63,7 @@ def create_app(graph=None, *, database_path: str | None = None) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "storage": "sqlite" if store.persistent else "memory", "clinical_validation": False,
+        return {"status": "ok", "storage": store.backend, "clinical_validation": False,
                 "rag": True, "rag_corpus_configured": bool(os.getenv("MEDCARE_RAG_PATH")), "agent_2": False}
 
     @app.post("/conversations", response_model=IntakeSession, status_code=201)
@@ -99,6 +106,11 @@ def create_app(graph=None, *, database_path: str | None = None) -> FastAPI:
                 limit: int = Query(50, ge=1, le=200)):
         """Read persisted messages in conversation order, including doctor and AI messages."""
         with store.transaction():
+            if hasattr(store, "history"):
+                messages = store.history(conversation_id, offset, limit)
+                if messages is None:
+                    raise HTTPException(404, "Conversation not found")
+                return [Message.model_validate(message) for message in messages]
             session = load_session(conversation_id)
             return session.conversation.messages[offset:offset + limit]
 

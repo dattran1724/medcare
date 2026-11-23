@@ -12,3 +12,12 @@ build/
 *.sqlite3-wal
 *.sqlite3-shm
 data/rag/
+rag/data/pdf/*
+!rag/data/pdf/.gitkeep
+rag/data/markdown/*
+!rag/data/markdown/.gitkeep
+rag/data/chunks/*
+!rag/data/chunks/.gitkeep
+rag/data/embeddings/*
+!rag/data/embeddings/.gitkeep
+rag/data/review/

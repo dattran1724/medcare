@@ -1,6 +1,7 @@
 """Small transactional JSON store for the local API; not a medical-record backend."""
 import json
 import sqlite3
+import os
 from contextlib import contextmanager
 from threading import RLock
 
@@ -8,6 +9,7 @@ from threading import RLock
 class LocalStore:
     def __init__(self, path: str | None = None):
         self.persistent = bool(path and path != ":memory:")
+        self.backend = "sqlite" if self.persistent else "memory"
         self._connection = sqlite3.connect(path or ":memory:", timeout=5,
                                             isolation_level=None, check_same_thread=False)
         self._connection.execute("""CREATE TABLE IF NOT EXISTS agent_data (
@@ -47,3 +49,26 @@ class LocalStore:
     def close(self):
         with self._lock:
             self._connection.close()
+
+
+class StorageError(RuntimeError):
+    """Safe storage failure; connection strings and driver errors stay private."""
+
+
+class StorageConflict(StorageError):
+    """Another request changed a record while this turn was running."""
+
+
+def create_store(database_path=None):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=False)
+    except ImportError:
+        pass
+    if database_path is not None:
+        return LocalStore(database_path)
+    uri = os.getenv("MONGODB_URI", "").strip()
+    if uri:
+        from medical_chatbot.mongo_storage import MongoStore
+        return MongoStore(uri, os.getenv("MONGODB_DATABASE", "medcare_chatbot"))
+    return LocalStore(os.getenv("MEDCARE_DB_PATH") or "agent1.sqlite3")

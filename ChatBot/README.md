@@ -457,7 +457,69 @@ medical correctness or full language understanding.
 not proof that a remote human received it. Production still requires access
 control, data retention/migration policy, backup and proper message delivery.
 
-### Local SQLite persistence
+### MongoDB Atlas persistence
+
+Install the MongoDB extra into the project environment:
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[api,gemini,mongodb,dev]"
+```
+
+Configure `.env` (real credentials belong only in `.env`, never `.env.example`):
+
+```dotenv
+MONGODB_URI="mongodb+srv://USER:ENCODED_PASSWORD@CLUSTER/?retryWrites=true&w=majority"
+MONGODB_DATABASE=medcare_chatbot
+```
+
+Start the API normally. Configuration loads before storage is selected. A nonempty
+MONGODB_URI selects MongoDB and startup validates connectivity/indexes; failure does
+not silently fall back to SQLite. `/health` reports `storage: mongodb`. Atlas access
+requires a database user with read/write permissions and your IP on its access list.
+
+Collections:
+
+| Collection | Purpose |
+| --- | --- |
+| conversations | Patient ID, creation/update time, message count, state version |
+| messages | Current messages in sequence order, unique conversation/message ID |
+| facts | Current facts, unique conversation/fact ID |
+| sessions | Clinical state, runtime metadata and references to messages/facts |
+| turns | Cached replies, retry counts/results and pre-turn snapshots |
+| message_versions / fact_versions | Immutable content-addressed revisions used by snapshots |
+
+Snapshots reference immutable versions so updating a message's case tags does not
+rewrite old cached replies or pre-turn data. History pagination reads messages
+directly, without loading full clinical sessions. Message and fact bodies are not
+embedded repeatedly in session/reply documents; their reference arrays still grow,
+so large conversations need retention/archival planning before production use.
+
+Gemini runs outside MongoDB transactions. Only the final short database commit uses
+a snapshot/majority transaction with version checks. Concurrent stale writers return
+409; failed writes return sanitized 503. Driver transaction retries never rerun Gemini.
+Concurrent duplicate requests can both call Gemini, but cannot commit two different
+outcomes; retrying the request after reloading returns the already saved outcome.
+
+Existing SQLite files remain untouched. There is no automatic data migration. An
+explicit database_path argument still selects SQLite for offline tests; without
+MONGODB_URI the SQLite fallback below remains available.
+
+Offline tests do not connect to Atlas. To opt into real Atlas integration tests:
+
+```powershell
+$env:PYTHONPATH = 'src'
+$env:MEDCARE_TEST_MONGODB = '1'
+.venv\Scripts\python.exe -m pytest tests/integration/test_mongodb.py -q -p no:cacheprovider --tb=short
+Remove-Item Env:MEDCARE_TEST_MONGODB
+```
+
+These tests use fake clinical providers and unique synthetic conversation IDs.
+They clean up only their own records, never drop collections/databases, and cover
+restart/idempotency, retry snapshots, transaction rollback, concurrent writes and
+historical message revisions. If a test is forcibly interrupted, its synthetic
+records may remain and can be identified by its synthetic patient/conversation IDs.
+
+### Local SQLite fallback
 
 ```powershell
 $env:MEDCARE_DB_PATH = '.\agent1.sqlite3'
@@ -488,6 +550,377 @@ Tests use injected providers and FastAPI TestClient; no real Gemini calls. Run:
 $env:PYTHONPATH = "src"
 .venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
 ```
+
+## PDF preparation: Docling to Markdown
+
+Run these commands from the repository root. The root `rag/` package contains
+document-preparation tools, separate from the existing Agent 1 retrieval module.
+Only PDF-to-Markdown is implemented here; it does not chunk, embed or write MongoDB.
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[documents]"
+.venv\Scripts\python.exe -m rag.extract .\rag\data\pdf\guideline.pdf
+```
+
+To process all PDFs directly in `rag/data/pdf/`, run without a source argument:
+
+```powershell
+.venv\Scripts\python.exe -m rag.extract
+```
+
+The batch shares one converter/model instance, skips existing Markdown by default,
+continues after individual PDF failures, and prints saved/skipped/failed totals.
+Use `--overwrite` to convert existing outputs again, or `--ocr force` for scans.
+It does not scan subfolders. You can also pass another input folder; `-o` then
+specifies an output folder. A nonzero exit code means the batch had a failure or
+contained no PDFs. An explicit single PDF and `-o PATH.md` remain supported.
+
+Default output: `rag/data/markdown/guideline.md`. Override it with `-o PATH.md`.
+Both data directories are ignored by Git. The PDF remains untouched. An existing
+output is only replaced with `--overwrite`, after successful conversion.
+
+Device selection applies to layout, tables and EasyOCR together:
+
+```powershell
+# Default: choose CUDA if available, otherwise CPU (process all PDFs):
+.venv\Scripts\python.exe -m rag.extract
+# Require an NVIDIA GPU; fail clearly if CUDA-enabled PyTorch is unavailable:
+.venv\Scripts\python.exe -m rag.extract --device cuda
+# Force CPU:
+.venv\Scripts\python.exe -m rag.extract --device cpu
+```
+
+Docling selects the accelerator and reports unavailable devices. OCR follows the
+same accelerator. Layout/OCR/table batches are limited to one page to
+reduce peak VRAM usage on smaller GPUs. GPU support requires a working NVIDIA driver
+and CUDA-enabled PyTorch, not just an installed CUDA Toolkit. Low free VRAM can still
+cause out-of-memory failures; close other GPU workloads or select CPU. There is no
+silent CPU fallback after a CUDA runtime failure.
+
+```powershell
+# Native PDF text + layout/table detection, without OCR:
+.venv\Scripts\python.exe -m rag.extract .\rag\data\pdf\guideline.pdf --ocr off
+# Full-page OCR for scans or broken text layers (EasyOCR Vietnamese + English):
+.venv\Scripts\python.exe -m rag.extract .\rag\data\pdf\guideline.pdf --ocr force
+```
+
+Default `--ocr auto` enables Docling's default OCR region selection; it does not
+guarantee detection of every broken text layer. EasyOCR uses Vietnamese + English.
+Docling layout/table and EasyOCR weights may download on first use. Inference
+runs locally, with remote conversion services disabled; no Gemini key is required.
+The PDF dependencies are optional and are not needed to run Agent 1.
+
+Docling uses its PDFium backend for physical page numbering and native text,
+with heading hierarchy recovery enabled. Markdown is exported page by page:
+
+```markdown
+<!-- page: 1 -->
+
+# Section heading
+Content...
+
+<!-- page: 2 -->
+
+Continuation...
+```
+
+Markers are physical PDF page numbers, not printed page labels. Empty pages retain
+their number and produce a review warning; wholly unreadable or partially failed
+documents are not published. Figures are placeholders/captions, not interpreted.
+Cross-page tables may repeat in per-page export and are flagged for review.
+By default, pdfplumber reconstructs ruled tables from native PDF lines and text.
+Replacement requires a unique same-page table with bounding-box overlap (IoU >= 0.8),
+but does not require matching Docling's row/column count. Actual cell rectangles
+determine spans; empty cells stay empty. This can repair a misordered model grid
+and recover blank answer columns. Borderless, scanned, cross-page and unmatched
+tables retain Docling's result; this does not certify their accuracy. Tables with
+no native text retain the OCR result. Use `--tables docling` for comparison.
+
+All tables are exported as Markdown pipe tables. Cell line breaks are retained
+as inline `<br>` markers; whole HTML tables are not generated. This preserves
+lines within an existing cell without guessing which wrapped lines form drug/dose pairs.
+Captions are placed before/after their table according to source geometry.
+Docling expands actual row/column spans into
+the corresponding grid cells, so each data row retains its group context. Multi-level
+headers are joined per column (e.g. `Allowed - FEV1`). Tables without detected column
+headers get a blank Markdown header; their first data row remains data. Real empty
+cells stay empty, and numeric strings such as `2.10` are not converted to numbers.
+There is no whole-table HTML output mode or string-based HTML repair. This preserves detected
+cell relationships, not visual merged-cell formatting, and cannot recover a cell
+or column that the recognition model missed.
+Compare complex tables, figures and numeric content against the source before use.
+
+For embedding-oriented text, use `--table-format rows`. Each source data row becomes
+one Markdown list item with column labels, any detected caption and explicit blank
+cell markers. Multi-level headers are combined per column; duplicate labels include
+their source column number. A merged-cell group has shared fields followed by
+nested source rows, keeping each criterion paired with its score. Values are never
+flattened into separate column lists. A cell listing several drugs/doses stays
+intact rather than being guessed into pairs. The existing chunker keeps each top-level list item whole
+and adds the heading path when splitting a long section. Native cell line breaks
+remain as indented text, without `<br>` tags. Standalone table-ID comments are for
+review and are excluded by the current chunker; they are not yet structured chunk metadata.
+In `rows` mode, continuation is inferred only between the last/first tables on
+adjacent pages with matching nonempty headers and aligned column boundaries
+(within 2% of page width). The previous table must reach the bottom 15% of its
+page and the next must start in the top 15%, with no intervening body text,
+heading or new caption. A known title anchors the chain. Accepted fragments share
+a `table_id` and title but keep their own `part_id`, physical page and local row
+numbers; cell data is not merged or renumbered. `continuation: inferred` and a
+review warning make the heuristic explicit. Similar-header fragments lacking the
+other signals retain separate IDs and `continuation: unconfirmed`. New captions
+and changed headers start independent tables. This cannot prove every continuation.
+
+```powershell
+.venv\Scripts\python.exe -m rag.extract .\rag\data\pdf\guideline.pdf --table-format rows --overwrite
+```
+
+Default `--table-format markdown` keeps pipe tables for visual review. Store trial
+outputs in `rag/data/review`, rather than keeping both formats in the batch chunk
+input folder. Extraction/formatting checks do not measure retrieval accuracy.
+
+For targeted review without reprocessing a long document:
+
+```powershell
+.venv\Scripts\python.exe -m rag.extract .\rag\data\pdf\guideline.pdf --pages 235 236 --ocr off
+```
+
+The default sample output gets `.pages-235-236.md` in its name and keeps physical
+page markers 235/236. Table recognition uses accurate TableFormer mode and
+Docling's default cell matching; disabling it lost text on the reviewed PDF and
+is not the default. Page count/range is checked against the physical PDF before
+publishing. Re-extract old Markdown to repair old page markers; existing files
+are not silently rewritten.
+
+Review a known problematic table without replacing the production Markdown:
+
+```powershell
+.venv\Scripts\python.exe -m rag.extract .\rag\data\pdf\3hdnititchuynha.pdf --pages 242 244 --ocr off --device cuda -o .\rag\data\review\3hdnititchuynha.updated.pages-242-244.md --overwrite
+```
+
+Keep review samples outside `rag/data/markdown` so batch chunking does not ingest
+them as duplicate documents. These checks do not establish accuracy on all PDFs.
+Merged text is projected by provenance character spans so later-page text is not
+dumped onto the first page; detected source blocks retain paragraph breaks.
+Within a text block, native PDF line spacing restores paragraph breaks where an
+unusually large gap and a uniquely matching line start are present. Only whitespace
+is inserted; consecutive numbered entries at native line starts are also separated,
+including uniformly spaced lists. Wrapped lines stay joined and tables are excluded. Uniformly spaced
+paragraphs and scanned text can still need review. `rag/layout.py` also repairs the
+specific pattern of headings fused across a clear vertical gutter, along with their
+following column blocks (e.g. agency/national heading or recipients/signature).
+It uses native PDF coordinates/text, keeps left-column blocks together before the
+right column and requires exact character conservation ignoring whitespace. Tables
+are excluded; plain paired body text without a fused heading is not reinterpreted.
+Scans without a usable native text layer and unsupported layouts remain unchanged.
+Each repair emits a reading-order review warning; this is not a guarantee of correct
+layout for every document. Full-page splitting into fixed left/right halves is not used.
+
+Offline tests use injected conversion and the real serializer when installed.
+For a real two-column PDF smoke test (first run can download model weights):
+
+```powershell
+$env:MEDCARE_TEST_DOCLING = '1'
+.venv\Scripts\python.exe -m pytest tests/integration/test_document_extraction_live.py -q -p no:cacheprovider
+Remove-Item Env:MEDCARE_TEST_DOCLING
+```
+
+To run that smoke test on CUDA, also set `MEDCARE_TEST_DOCLING_DEVICE=cuda` before
+pytest. It checks that conversion actually allocates GPU memory, not only that
+the configuration requests CUDA. Unset that variable after the test.
+
+## Markdown chunking before embedding
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[chunking]"
+.venv\Scripts\python.exe -m rag.chunk .\rag\data\markdown\guideline.md --overwrite
+```
+
+`rag/chunk.py` uses MarkdownIt's actual heading positions and levels to retain
+source boundaries, formatting and indentation. Repeated titles at different
+positions remain different sections. It does not infer hierarchy from numbering,
+uppercase text or adjacency, and does not guess missing chapter/disease context.
+
+Only sections above the token target are split further, in this order:
+
+- Markdown paragraphs first; an oversized paragraph splits at sentence boundaries
+  using NLTK Punkt with common medical-title abbreviations. It needs no model download.
+- Lists split at top-level items, keeping nested children with their parent.
+- Tables split at whole rows and repeat their existing column header.
+
+The immediately preceding paragraph is carried with each list/table fragment so
+its conditions are retained. Split fragments also carry their heading path in text.
+There is no fixed overlap or rewriting. Sentence detection is structural, not a
+clinical interpretation; verify conditions and negations when reviewing retrieval.
+An indivisible sentence, nested item, table row, introduction or code block that
+exceeds the target stays intact with `oversized_preserved_for_review`.
+
+The default target is **1,200 tokens**, measured by reference tokenizer
+`cl100k_base`. Set `--max-tokens 800` to change it. The limit is soft; the embedding
+step must check its own model tokenizer and input limit. Standalone technical
+comments are excluded from embedding text; comments inside code examples stay.
+
+Output: `rag/data/chunks/<name>.jsonl`, one chunk per line with text, heading path,
+source pages/line bounds, stable ID, source checksum, token count and review flags.
+Each section has `section_id`, `section_path`, zero-based `part_index`, `part_count`
+and source section bounds. Only part 0 stores the canonical `section_text` and
+`section_pages`, so retrieval can return the exact full section without repeating
+introductions or table headers. `document_chunk_count` records the complete file size.
+Page metadata includes repeated source introductions/table headers. Line bounds
+are conservative when a fragment repeats context or splits a single source line.
+Existing files require `--overwrite`; conversion failure leaves the old output intact.
+Rebuild old JSONL after changing Markdown or chunk settings.
+
+Without a source argument, all Markdown directly in `rag/data/markdown` is processed.
+Batch mode skips existing files; `-o` selects an output folder. Review samples such
+as `.pages-*.md` are included too, so select the full document explicitly to avoid
+indexing duplicate content. No embedding, LLM, API or database is called.
+
+
+## Local dense embedding: BGE-M3
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[embedding]"
+# All JSONL files directly in rag/data/chunks:
+.venv\Scripts\python.exe -m rag.embed
+# One file, or regenerate existing results:
+.venv\Scripts\python.exe -m rag.embed .\rag\data\chunks\3375_QD-BYT_679213.jsonl --overwrite
+# CPU / smaller GPU batch:
+.venv\Scripts\python.exe -m rag.embed --device cpu --batch-size 2
+```
+
+`rag/embed.py` uses `sentence-transformers` with `BAAI/bge-m3`, pinned to revision
+`5617a9f61b028005a4858fdac845db406aefb181`. First execution downloads the model
+weights from Hugging Face (roughly 2.3 GB plus tokenizer/config files); later runs
+reuse the local cache. Encoding runs locally and needs no Gemini/API key.
+Automatic device selection uses Sentence Transformers; CUDA uses float16 weights,
+CPU uses the default precision. Default batch size is 4; lower it if GPU memory is limited.
+
+Each chunk's heading path is prepended when it is not already a leading prefix.
+The exact input is retained as `embedding_text`; the original `text`, IDs, pages,
+source checksum and other chunk metadata remain unchanged. The BGE-M3 tokenizer
+checks input length including special tokens before encoding. If any chunk exceeds
+`model.max_seq_length` (8,192 for this model), the file fails with its chunk ID;
+no content is silently truncated and the previous output remains untouched.
+
+Output: `rag/data/embeddings/<name>.jsonl`. Each record adds a normalized, finite
+1,024-dimensional dense `embedding`, model/revision, dimensions, normalization flag
+and `embedding_token_count`. The existing chunk `token_count` uses a different
+reference tokenizer and is not the embedding input length. Sparse embeddings,
+reranking, MongoDB writes and Agent 1 retrieval integration are not part of this script.
+
+Batch mode loads one model, skips existing outputs, and continues after individual
+file failures with a nonzero exit code. Use `--overwrite` after changing source chunks.
+Add `--reuse-existing` to refresh metadata while reusing cached vectors only when
+embedding text, token count, model/revision and normalized finite dimensions match.
+Chunk IDs alone are never a reuse key; changed inputs are encoded normally. Keep old
+embedding JSONL files in place to use this cache. Queries must later use the same model revision and normalized dense encoding.
+Unit tests inject a small fake encoder to verify batches, validation and file safety;
+they do not measure real BGE-M3 retrieval quality or GPU performance.
+
+
+## Upload embeddings to MongoDB Atlas
+
+Use the existing `.env` keys `MONGODB_URI` and `MONGODB_DATABASE`. The target is
+always the `rag_chunks` collection; conversation collections are not touched.
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[mongodb]"
+# All JSONL files directly in rag/data/embeddings:
+.venv\Scripts\python.exe -m rag.upload
+# One file:
+.venv\Scripts\python.exe -m rag.upload .\rag\data\embeddings\3375_QD-BYT_679213.jsonl
+```
+
+Default batch size: 100 (`--batch-size 50` to change it). No model is loaded and no
+embedding is generated again. Each file is validated for nonempty IDs/text, unique
+IDs, finite nonzero 1,024-dimensional vectors and the pinned BGE-M3 model/revision
+before that file's first database write. All embedding and source metadata is retained.
+
+Records use `_id = chunk_id` and batched replacement upserts. Rerunning the same
+files updates existing records without creating duplicates. Network failures can
+leave earlier batches/files committed; fix the issue and rerun. Upload stops on the
+first error with a nonzero exit code, and database errors never print the URI.
+
+Default upload only upserts; it does not delete older IDs. Use `--sync` after
+re-chunking. Sync requires a complete document manifest and every section part,
+uploads all batches successfully, then deletes obsolete IDs for that `document_id`
+only. A failed batch never authorizes cleanup. Other documents, collections and
+the Vector Search index are untouched. Upload creates a normal compound index for section lookup. Uploads are not an atomic version switch: avoid querying
+mid-migration and wait for Atlas indexing afterwards. The script does not create
+or change the Vector Search index. Use the already configured
+`rag_vector_index` on `embedding`, 1,024 dimensions, cosine; wait for Atlas indexing
+before testing vector queries. Unit tests use a fake collection; no Atlas data is
+written by the default test suite.
+
+
+## Search uploaded RAG chunks
+
+```powershell
+.venv\Scripts\python.exe -m rag.search "Chẩn đoán và điều trị tăng huyết áp" --top-k 5
+```
+
+`rag/search.py` reads `.env`, `rag_chunks` and `rag_vector_index`; it writes no data.
+It reuses the pinned BGE-M3 loader and reranks with multilingual
+`BAAI/bge-reranker-v2-m3`, revision `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`.
+The reranker weights download on first use (roughly 2.3 GB) and are cached locally.
+CUDA uses float16 and reranking batch size 1. Use `--device cpu` if GPU memory is
+insufficient. An application should keep both models and MongoClient loaded, then
+call `search(query, collection, model=model, reranker=reranker)` across requests.
+CLI launches still pay model startup costs.
+
+Search retrieves at least 20 candidates (four times `--top-k` when larger). Titles
+remain in vector search; they are never deleted from the index. A title-only match
+is expanded only if the matching local Markdown checksum and actual heading levels
+prove a subtree. Child lookup is constrained by document ID, source checksum and
+source line boundaries; it is capped at the candidate count. Without a verified
+source outline, the title is not blindly attached to following chunks. It is not
+returned alone as evidence. Current flat `##` sources do not provide parent-child
+relations merely because headings are adjacent, uppercase or numbered.
+
+The cross-encoder ranks question/passage pairs using actual content and known
+heading context. Exact duplicate chunks and identical overlapping source passages
+are removed; distinct source sections are retained. Results include `rerank_score`,
+original vector `score`, text, source/pages and heading metadata. Expanded children
+have `score: null` and `via_heading` instead of an invented vector score.
+
+Inputs are checked against embedding/reranker context limits; evidence is not
+silently truncated. No uncalibrated relevance threshold is applied. Scores rank
+passages; they are not clinical confidence. An empty result is `[]`. Query errors
+return a nonzero exit code. This is retrieval only, without Gemini or Agent 1
+integration. Existing data needs section metadata; use the migration commands below.
+Validate relevance on representative questions before treating retrieval as reliable.
+
+
+### Retrieve complete sections after chunking changes
+
+After reranking, results are grouped by document ID, source checksum and section ID.
+All parts of a matching section are fetched in `part_index` order. A complete,
+consistent set uses the canonical `section_text`, removing repeated context exactly.
+The returned `parts` retain individual chunk IDs, pages and line bounds. The score
+and chunk ID identify the matched seed; expanded text may contain the whole section.
+
+`--max-context-tokens 4000` sets the shared context budget across results, measured
+with reference tokenizer `cl100k_base`. If the complete section does not fit, return
+a contiguous window of whole parts around the hit and set `section_complete: false`.
+Missing parts or legacy documents without section metadata are also marked incomplete.
+No individual sentence/table row is sliced. Partial windows retain original per-part
+context rather than guessing how to remove overlapping text.
+
+To update existing data, run in order (no manual deletion):
+
+```powershell
+.venv\Scripts\python.exe -m rag.chunk --overwrite
+.venv\Scripts\python.exe -m rag.embed --overwrite --reuse-existing
+.venv\Scripts\python.exe -m rag.upload --sync
+.venv\Scripts\python.exe -m rag.search "Chẩn đoán và điều trị tăng huyết áp" --top-k 5
+```
+
+Local writes replace files only after success. Keep the old embedding files until
+the metadata refresh succeeds. Upload sync does not delete files, databases or the
+Vector Search index. It does not remove documents omitted from the selected local
+files. A flat source heading structure still cannot prove missing disease/chapter
+relationships; section expansion solves split sections, not missing source hierarchy.
 
 ## Local medical RAG pipeline
 

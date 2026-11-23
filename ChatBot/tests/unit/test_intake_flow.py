@@ -9,6 +9,7 @@ from medical_chatbot.schemas.conversation import Conversation, Message
 
 @pytest.fixture(autouse=True)
 def isolate_runtime_database(monkeypatch):
+    monkeypatch.setenv("MONGODB_URI", "")
     monkeypatch.setenv("MEDCARE_DB_PATH", ":memory:")
     monkeypatch.delenv("MEDCARE_RAG_PATH", raising=False)
 
@@ -691,6 +692,25 @@ def test_database_config_reads_environment(tmp_path, monkeypatch):
     with TestClient(create_app(graph())) as client:
         assert client.get("/health").json()["storage"] == "sqlite"
     assert path.exists()
+
+
+def test_configured_mongodb_is_selected_without_silent_sqlite_fallback(monkeypatch):
+    from medical_chatbot.storage import create_store
+    monkeypatch.setenv("MONGODB_URI", "mongodb://example.invalid")
+    monkeypatch.setenv("MONGODB_DATABASE", "synthetic")
+    store = create_store()
+    assert store.backend == "mongodb" and store._client is None  # No network on construction.
+    store.close()
+
+
+def test_explicit_sqlite_path_overrides_mongodb_for_offline_tests(monkeypatch):
+    from medical_chatbot.storage import create_store
+    monkeypatch.setenv("MONGODB_URI", "mongodb://example.invalid")
+    store = create_store(":memory:")
+    try:
+        assert store.backend == "memory"
+    finally:
+        store.close()
 
 
 def test_two_api_instances_share_idempotent_message_commit(tmp_path):
