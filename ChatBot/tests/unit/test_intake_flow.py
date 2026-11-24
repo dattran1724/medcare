@@ -433,8 +433,9 @@ def test_complete_intake_with_unknown_risk_does_not_call_rag_or_infer_safe():
 
 
 @pytest.mark.parametrize("rag_status,expected", [
-    ("FAILED", None), ("UNAVAILABLE", "HANDOFF_DOCTOR"), ("INSUFFICIENT", "HANDOFF_DOCTOR")])
-def test_specialist_rag_failure_is_distinct_from_missing_knowledge(rag_status, expected):
+    ("FAILED", "HANDOFF_DOCTOR"), ("UNAVAILABLE", "HANDOFF_DOCTOR"),
+    ("INSUFFICIENT", "HANDOFF_DOCTOR")])
+def test_specialist_rag_failure_or_missing_knowledge_hands_off(rag_status, expected):
     from medical_chatbot.rag import RagResult
     from medical_chatbot.schemas.risk import ProcessingError
     class StubRag:
@@ -447,11 +448,7 @@ def test_specialist_rag_failure_is_distinct_from_missing_knowledge(rag_status, e
     result = run_turn(graph(extract_json=extract, rag_service=StubRag()), session(), message())
     assert result.output.next_action == expected
     case = result.session.conversation.clinical_state.cases[0]
-    if rag_status == "FAILED":
-        assert result.output.status == "FAILED" and result.output.error.retryable
-        assert case.workflow.status != "WAITING_DOCTOR"
-    else:
-        assert case.workflow.status == "WAITING_DOCTOR"
+    assert case.workflow.status == "WAITING_DOCTOR"
 
 
 def test_unknown_answer_remains_visible_when_other_intake_items_complete():

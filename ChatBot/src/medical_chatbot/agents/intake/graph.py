@@ -197,12 +197,11 @@ def build_intake_graph(*, extract_json: Callable | None = None,
         elif state["screening"] and state["screening"].doctor_request:
             output = Agent1Output(status="COMPLETED", risk=risk, next_action="HANDOFF_DOCTOR",
                 response_text="Đã ghi nhận yêu cầu gặp bác sĩ của bạn; chưa có xác nhận bác sĩ tiếp nhận.")
-        elif state["extraction_failed"] or risk.assessment_status == "FAILED" or (rag and rag.status == "FAILED"):
-            error = (state["extraction_error"] if state["extraction_failed"]
-                     else risk.error if risk.assessment_status == "FAILED" else rag.error)
+        elif state["extraction_failed"] or risk.assessment_status == "FAILED":
+            error = state["extraction_error"] if state["extraction_failed"] else risk.error
             output = Agent1Output(status="FAILED", risk=risk, error=error or ProcessingError(
-                stage="rag", code="PROVIDER", message="RAG processing failed", retryable=True))
-        elif rag and rag.status in {"UNAVAILABLE", "INSUFFICIENT"}:
+                stage="routing", code="PROVIDER", message="Message processing failed", retryable=True))
+        elif rag and rag.status in {"UNAVAILABLE", "INSUFFICIENT", "FAILED"}:
             output = Agent1Output(status="COMPLETED", risk=risk, next_action="HANDOFF_DOCTOR",
                 response_text="Tài liệu hiện có chưa đủ để tiếp tục thu thập thông tin chuyên môn. Đã ghi nhận yêu cầu bác sĩ xem xét; chưa có xác nhận tiếp nhận.")
         else:
@@ -269,7 +268,7 @@ def build_intake_graph(*, extract_json: Callable | None = None,
             state["screening"] and state["screening"].needs_external_evidence)
         if not requested:
             return {"rag": None, "rag_skip_reason": "not_requested"}
-        service = rag_service or IntakeRag(os.getenv("MEDCARE_RAG_PATH"))
+        service = rag_service or IntakeRag()
         return {"rag": service.assess(state["session"].conversation, state["message"], case.case_id), "rag_skip_reason": None}
 
     graph = StateGraph(Agent1GraphState)
