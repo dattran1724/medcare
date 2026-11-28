@@ -32,9 +32,16 @@ class GeneratedQuestion(Schema):
 SYSTEM_INSTRUCTION = """You write intake questions in Vietnamese for a medical chatbot.
 Use only the approved scopes. Cover all scopes, adding no other information requests.
 Use short, natural, empathetic wording and accessible explanations when needed.
+The application may prepend a confirmation when it accepted a fact outside these
+scopes; do not add a generic acknowledgement yourself. Ask only for the still-open
+approved scopes, even when the latest message supplied other useful information.
 Use patient context and recent messages to avoid asking for known information.
 Follow field_guidance exactly: onset asks WHEN, not sudden/gradual; duration asks
-overall time, not each episode. Never ask for a known field just to fill a selected scope.
+overall time, not each episode. For course, ask whether the symptom overall has
+improved, worsened or stayed the same since onset; do not ask when or whether it
+hurts more at particular moments (severity/frequency). Never ask for a known field
+just to fill a selected scope. If the user says they do not know, accept that and
+do not repeat the same question in different words.
 If a scope was already asked but remains unanswered, acknowledge any correction
 or partial answer and ask a brief clarification; do not interpret silence as refusal.
 Do not diagnose, prescribe, give treatment advice, or claim a doctor has accepted.
@@ -47,7 +54,7 @@ to the patient. Your scope IDs are bookkeeping, not permission to add extra ques
 
 def gemini_generate(payload: dict, *, system_instruction: str = SYSTEM_INSTRUCTION,
                     response_schema: dict | None = None) -> str:
-    """At most two attempts for transient service errors; no model fallback."""
+    """Retry transient provider failures up to three attempts; never retry invalid output."""
     try:
         from dotenv import load_dotenv
         from google import genai
@@ -65,7 +72,7 @@ def gemini_generate(payload: dict, *, system_instruction: str = SYSTEM_INSTRUCTI
     try:
         with genai.Client(api_key=api_key, http_options={
             "timeout": timeout, "retry_options": {
-                "attempts": 2, "initial_delay": 1.0, "max_delay": 2.0,
+                "attempts": 3, "initial_delay": 1.0, "max_delay": 4.0,
                 "http_status_codes": [500, 502, 503, 504],
             },
         }) as client:

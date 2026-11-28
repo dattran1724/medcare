@@ -50,6 +50,14 @@ class FactProposal(Schema):
     def validate_fact_value(self) -> Self:
         if self.field.is_scalar:
             self.key = self.field.value.rsplit(".", 1)[-1]
+        elif self.status == "ABSENT":
+            aliases = {
+                FactField.ASSOCIATED_SYMPTOMS: {"triệu chứng kèm theo", "triệu chứng đi kèm"},
+                FactField.AGGRAVATING_FACTORS: {"yếu tố làm nặng", "yếu tố làm nặng hơn"},
+                FactField.RELIEVING_FACTORS: {"yếu tố làm giảm", "yếu tố làm dịu"},
+            }
+            if self.key.casefold().strip() in aliases.get(self.field, set()):
+                self.key = self.field.value.rsplit(".", 1)[-1]
         Fact(fact_id="validation-only", field=self.field, key=self.key,
              value=self.value, status=self.status, source=self.source,
              target_case_id="validation-only" if self.field.is_case_field else None)
@@ -74,6 +82,7 @@ class InputProcessorOutput(Schema):
     case_result: CaseResolution
     patient_facts: list[FactProposal] = Field(default_factory=list)
     case_facts: list[FactProposal] = Field(default_factory=list)
+    source_rejected_count: int = Field(default=0, ge=0)
     need_medical_rag: bool = False
     rag_reason: NonEmpty | None = None
     unavailable_answers: list[UnavailableAnswer] = Field(default_factory=list)
@@ -115,8 +124,9 @@ class Agent1Output(Schema):
     requirements: list[Requirement] = Field(default_factory=list)
     unresolved_conflict_count: int = Field(default=0, ge=0)
     chief_complaint_known: bool = False
-    next_action: Literal["ASK_MORE", "PASS_TO_AGENT_2", "HANDOFF_DOCTOR", "EMERGENCY"] | None = None
+    next_action: Literal["ASK_MORE", "CONTINUE_AI", "PASS_TO_AGENT_2", "HANDOFF_DOCTOR", "EMERGENCY"] | None = None
     response_text: NonEmpty | None = None
+    risk_warning: NonEmpty | None = None
     error: ProcessingError | None = None
 
     @model_validator(mode="after")
@@ -131,12 +141,15 @@ class Agent1Output(Schema):
                 raise ValueError("NO_REPLY cannot contain an action or reply")
         elif self.next_action is None:
             raise ValueError("COMPLETED requires an action")
-        if self.next_action in {"ASK_MORE", "HANDOFF_DOCTOR", "EMERGENCY"} and not self.response_text:
+        if self.next_action in {"ASK_MORE", "CONTINUE_AI", "HANDOFF_DOCTOR", "EMERGENCY"} and not self.response_text:
             raise ValueError("This action requires a user-facing message")
         if self.next_action == "EMERGENCY" and not self.risk.emergency:
             raise ValueError("EMERGENCY requires an emergency risk assessment")
-        if self.next_action in {"ASK_MORE", "PASS_TO_AGENT_2"} and self.risk.result == "DANGEROUS":
+        if self.next_action == "PASS_TO_AGENT_2" and self.risk.result == "DANGEROUS":
             raise ValueError("DANGEROUS requires escalation")
+        if (self.risk.result == "DANGEROUS" and self.next_action in {"ASK_MORE", "CONTINUE_AI"}
+                and (not self.risk_warning or self.risk_warning not in self.response_text)):
+            raise ValueError("Continuing AI with DANGEROUS risk requires a visible warning")
         if self.next_action == "PASS_TO_AGENT_2":
             if (self.risk.assessment_status == "FAILED" or not self.chief_complaint_known
                 or self.unresolved_conflict_count

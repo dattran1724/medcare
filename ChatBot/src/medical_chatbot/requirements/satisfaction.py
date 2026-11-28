@@ -9,6 +9,10 @@ CORE_FIELDS = {
     "onset": "present_illness.onset",
     "duration": "present_illness.duration",
     "course": "present_illness.course",
+    "location": "present_illness.location",
+    "associated_symptoms": "present_illness.associated_symptoms",
+    "aggravating_factors": "present_illness.aggravating_factors",
+    "relieving_factors": "present_illness.relieving_factors",
 }
 
 

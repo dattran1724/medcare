@@ -4,7 +4,7 @@ from pydantic import ValidationError
 from medical_chatbot.schemas.clinical_state import ClinicalCase, ClinicalState
 from medical_chatbot.schemas.conversation import Conversation, Message
 from medical_chatbot.schemas.facts import Fact
-from medical_chatbot.schemas.outputs import Agent1Input, Agent1Output, CaseResolution, InputProcessorOutput
+from medical_chatbot.schemas.outputs import Agent1Input, Agent1Output, CaseResolution, FactProposal, InputProcessorOutput
 from medical_chatbot.schemas.requirements import Requirement
 from medical_chatbot.schemas.risk import RiskResult
 
@@ -45,6 +45,23 @@ def test_unknown_absent_and_uncertain_are_distinct():
     assert fact(status="ABSENT", value=None).status == "ABSENT"
     assert fact(status="UNCERTAIN", value=None).status == "UNCERTAIN"
     assert RiskResult().result is None
+
+
+@pytest.mark.parametrize(("field", "key", "canonical"), [
+    ("present_illness.associated_symptoms", "triệu chứng kèm theo", "associated_symptoms"),
+    ("present_illness.aggravating_factors", "yếu tố làm nặng", "aggravating_factors"),
+    ("present_illness.relieving_factors", "yếu tố làm dịu", "relieving_factors"),
+])
+def test_blanket_absent_list_key_is_canonical(field, key, canonical):
+    proposal = FactProposal(field=field, key=key, value=None, status="ABSENT",
+        source={"message_id": "m1", "source_text": "I have none"})
+    assert proposal.key == canonical
+
+
+def test_specific_absent_list_item_key_is_preserved():
+    proposal = FactProposal(field="present_illness.associated_symptoms", key="nausea",
+        value=None, status="ABSENT", source={"message_id": "m1", "source_text": "No nausea"})
+    assert proposal.key == "nausea"
 
 
 @pytest.mark.parametrize("changes", [

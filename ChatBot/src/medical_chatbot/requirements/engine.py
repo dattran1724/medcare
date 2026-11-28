@@ -42,6 +42,7 @@ def evaluate_requirements(
     state: ClinicalState, *, facts: Sequence[Fact] = (),
     conflicts: Sequence[PendingConflict] = (), additional: Sequence[Requirement] = (),
     risk: RiskResult | None = None, case_uncertain: bool = False,
+    doctor_handoff_pending: bool = False,
 ) -> RequirementResult:
     """Pure update. Save result.state to retain question tracking.
 
@@ -56,9 +57,9 @@ def evaluate_requirements(
         return RequirementResult(state=updated, status="NO_REPLY")
     if case:
         case.workflow.next_action = None
-    if risk.result == "DANGEROUS" or (
+    if not doctor_handoff_pending and (risk.result == "DANGEROUS" or (
         case and case.risk_assessment.level == "DANGEROUS"
-    ):
+    )):
         return RequirementResult(state=updated, status="HANDOFF_DOCTOR")
     if case_uncertain or case is None:
         return RequirementResult(state=updated, status="CLARIFY_CASE")

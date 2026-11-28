@@ -186,10 +186,13 @@ complaint-specific medical catalog has been implemented.
 
 Pass accepted fact history/conflicts into the engine and set case_uncertain
 from case resolution. Case/conflict clarification precedes routine questions.
-DOCTOR_ACTIVE produces NO_REPLY; danger produces a handoff
-status. The engine does not run safety monitoring while doctor mode is active;
-that remains the caller's responsibility. Optional/nonblocking questions are
-not proactively asked in this minimal flow.
+DOCTOR_ACTIVE produces NO_REPLY because the doctor is responding directly.
+WAITING_DOCTOR keeps AI active: new messages continue intake, and a pending
+DANGEROUS assessment is included as a required warning on every AI response.
+The first doctor request or danger handoff is written to the `doctor_notifications`
+outbox in PENDING state. This repository has no configured doctor delivery
+channel or dispatcher, so the outbox must be consumed by a later notification
+integration. Optional/nonblocking questions are not proactively asked here.
 
 No risk result is inferred from a stored SAFE case summary. When information
 is sufficient, the result is READY_FOR_REVIEW even if risk is NOT_ASSESSED.

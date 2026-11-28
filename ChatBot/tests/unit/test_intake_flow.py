@@ -24,6 +24,18 @@ def extraction(payload):
         if value in message["content"]:
             facts.append({"field": f"present_illness.{field}", "key": field, "value": value,
                           "status": "PRESENT", "source": {"message_id": message["message_id"], "source_text": value}})
+    content = message["content"].lower()
+    if "forehead" in content:
+        facts.append({"field": "present_illness.location", "key": "location", "value": "forehead",
+                      "status": "PRESENT", "source": {"message_id": message["message_id"], "source_text": "forehead"}})
+    for key, phrase, field in [
+        ("associated_symptoms", "no other symptoms", "present_illness.associated_symptoms"),
+        ("aggravating_factors", "nothing makes it worse", "present_illness.aggravating_factors"),
+        ("relieving_factors", "nothing relieves it", "present_illness.relieving_factors"),
+    ]:
+        if phrase in content:
+            facts.append({"field": field, "key": key, "value": None, "status": "ABSENT",
+                          "source": {"message_id": message["message_id"], "source_text": phrase}})
     return json.dumps({"case_result": resolution, "case_facts": facts})
 
 
@@ -60,7 +72,8 @@ def test_graph_multiple_turns_persists_history_and_question_metadata():
     history = first.session.conversation.messages
     assert [m.role for m in history] == ["USER", "AI"]
     assert [r.key for r in history[-1].asked_requirements] == ["onset", "course"]
-    second = run_turn(flow, first.session, message("started yesterday and is unchanged", "u2"))
+    second = run_turn(flow, first.session, message(
+        "started yesterday and is unchanged; forehead, no other symptoms, nothing makes it worse, nothing relieves it", "u2"))
     assert len(second.session.conversation.messages) == 4
     assert second.output.response_text
     assert second.session.conversation.messages[-1].content == second.output.response_text
@@ -95,6 +108,30 @@ def test_unanswered_question_after_correction_keeps_intake_open():
     third = run_turn(flow, second.session, message("headache unchanged", "u3"))
     assert third.output.next_action == "ASK_MORE"
     assert third.session.conversation.clinical_state.cases[0].present_illness.course == "unchanged"
+
+
+def test_explicit_unknown_for_single_asked_requirement_is_recorded_and_not_reasked():
+    initial = run_turn(graph(), session(), message())
+    conversation = initial.session.conversation
+    case_id = conversation.clinical_state.current_case_id
+    from medical_chatbot.schemas.requirements import Requirement
+    conversation.clinical_state.cases[0].missing_information = [Requirement(
+        key="course", target="present_illness.course", target_case_id=case_id,
+        priority="HIGH", source="CORE", reason="Synthetic course question", blocking=True,
+        asked_count=1)]
+    conversation.messages.append(Message(message_id="ai_course", role="AI",
+        content="Tình trạng đau thay đổi thế nào từ lúc bắt đầu?",
+        timestamp="2026-11-08T10:01:00+07:00",
+        case_ids=[case_id],
+        asked_requirements=conversation.clinical_state.cases[0].missing_information))
+    user = message("Tôi chưa rõ có nặng lên hay không.", "u2")
+    result = run_turn(graph(), IntakeSession(conversation=conversation), user)
+    case = result.session.conversation.clinical_state.cases[0]
+    course = next(r for r in case.missing_information if r.key == "course")
+    assert course.status == "UNKNOWN"
+    assert not any(p.field.value == "present_illness.course" for p in result.session.pending)
+    assert result.output.next_action != "ASK_MORE" or all(
+        r.key != "course" for r in result.session.conversation.messages[-1].asked_requirements)
 
 
 def test_default_database_and_paginated_history_survive_restart(tmp_path, monkeypatch):
@@ -426,7 +463,7 @@ def test_complete_intake_with_unknown_risk_does_not_call_rag_or_infer_safe():
             raise AssertionError("Basic intake completion should not call RAG")
     result = run_turn(graph(risk_json=lambda p: screening(p, result="UNCERTAIN"),
                             rag_service=UnexpectedRag()), session(),
-                      message("headache yesterday two days unchanged"))
+                      message("headache yesterday two days unchanged, forehead, no other symptoms, nothing makes it worse, nothing relieves it"))
     assert result.output.next_action == "PASS_TO_AGENT_2"
     assert result.output.risk.result is None
     assert result.session.conversation.clinical_state.cases[0].risk_assessment.level == "NOT_ASSESSED"
@@ -460,7 +497,8 @@ def test_unknown_answer_remains_visible_when_other_intake_items_complete():
                 status="UNKNOWN", source=dict(message_id="u2", source_text="do not know"))]
         return json.dumps(data)
     flow = graph(extract_json=extract)
-    first = run_turn(flow, session(), message("headache two days unchanged"))
+    first = run_turn(flow, session(), message(
+        "headache two days unchanged, forehead, no other symptoms, nothing makes it worse, nothing relieves it"))
     second = run_turn(flow, first.session, message("I do not know", "u2"))
     assert second.output.next_action == "PASS_TO_AGENT_2"
     assert second.output.requirements[0].status == "UNKNOWN"

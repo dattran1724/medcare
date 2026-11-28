@@ -17,6 +17,8 @@ from .risk_assessor import assess_message
 from medical_chatbot.graph.state import IntakeSession, TurnResult, Agent1GraphState
 from medical_chatbot.rag import IntakeRag
 
+DANGER_WARNING = "Bạn đang có dấu hiệu nguy hiểm nên cần được thăm khám trực tiếp. Trong lúc chờ bác sĩ, AI có thể tiếp tục ghi nhận thông tin nhưng không thay thế việc khám trực tiếp."
+
 
 def _stronger_danger(current, previous):
     """Retain danger across turns, but never hide a new emergency."""
@@ -27,18 +29,30 @@ def _stronger_danger(current, previous):
     return current
 
 
-def _ask(session, intake, risk, case_result, generate_json):
+def _ask(session, intake, risk, case_result, generate_json, *, source_rejected=False,
+         danger_warning=None):
     question = generate_question(intake, history=session.conversation.messages,
                                  conflicts=session.conflicts, generate_json=generate_json)
     if question is None:
         raise ValueError("Question was not generated")
+    message_id = session.conversation.messages[-1].message_id
+    selected_fields = {requirement.target for requirement in intake.selected}
+    recorded_other_facts = any(fact.source.message_id == message_id and fact.field not in selected_fields
+                               for fact in session.facts)
+    if source_rejected:
+        question = f"Mình đã ghi nhận phần thông tin xác thực được; một số chi tiết chưa được cập nhật. {question}"
+    elif recorded_other_facts:
+        question = f"Mình đã ghi nhận thông tin bạn vừa chia sẻ. {question}"
+    if danger_warning:
+        question = f"{danger_warning}\n\n{question}"
     message = make_question_message(intake, question, message_id=f"ai_{uuid4().hex}",
         timestamp=max(session.conversation.messages[-1].timestamp, datetime.now(timezone.utc)))
     sent = mark_question_sent(intake, question)
     output = Agent1Output(status="COMPLETED", risk=risk, case_result=case_result,
         requirements=next((c.missing_information for c in sent.state.cases
             if c.case_id == sent.state.current_case_id), []),
-        next_action="ASK_MORE", response_text=question, unresolved_conflict_count=len(session.conflicts))
+        next_action="ASK_MORE", response_text=question, unresolved_conflict_count=len(session.conflicts),
+        risk_warning=danger_warning)
     session.conversation.clinical_state = sent.state
     session.conversation.messages.append(message)
     session.pending_question = None
@@ -155,8 +169,6 @@ def build_intake_graph(*, extract_json: Callable | None = None,
         bound = next((c for c in clinical.cases if c.case_id == state.get("bound_case_id")), None)
         rag = state.get("rag")
         rag_ready = rag is not None and rag.status == "READY"
-        if rag_ready and rag.risk.assessment_status == "ASSESSED":
-            risk = _stronger_danger(rag.risk, risk) if risk.result == "DANGEROUS" else rag.risk
         if bound:
             message = message.model_copy(update={"case_ids": [bound.case_id]})
         elif risk.result == "DANGEROUS":
@@ -183,9 +195,11 @@ def build_intake_graph(*, extract_json: Callable | None = None,
         conversation.messages.append(message)
         output = None
         previous_danger = case and case.risk_assessment.level == "DANGEROUS"
-        if case and (case.response_mode == "DOCTOR_ACTIVE" or case.workflow.status == "WAITING_DOCTOR") and not risk.emergency:
+        doctor_pending = bool(case and case.workflow.status == "WAITING_DOCTOR")
+        danger_pending = bool(doctor_pending and risk.result == "DANGEROUS")
+        if case and case.response_mode == "DOCTOR_ACTIVE":
             output = Agent1Output(status="NO_REPLY", risk=risk)
-        elif risk.result == "DANGEROUS" or previous_danger:
+        elif (risk.result == "DANGEROUS" or previous_danger) and not doctor_pending:
             emergency = risk.emergency or bool(case and case.risk_assessment.requires_emergency_care)
             # Legacy case summaries without risk provenance cannot create a new
             # sourced emergency assessment. Normal sessions retain it above.
@@ -194,26 +208,57 @@ def build_intake_graph(*, extract_json: Callable | None = None,
                 next_action="EMERGENCY" if emergency else "HANDOFF_DOCTOR",
                 response_text=("Có dấu hiệu cần trợ giúp y tế khẩn cấp. Hãy tìm trợ giúp y tế ngay; không chờ phản hồi trong cuộc trò chuyện."
                     if emergency else "Thông tin hiện tại cần bác sĩ đánh giá trực tiếp. Hệ thống đã ghi nhận yêu cầu chuyển bác sĩ; chưa có xác nhận tiếp nhận."))
-        elif state["screening"] and state["screening"].doctor_request:
+        elif state["screening"] and state["screening"].doctor_request and not doctor_pending:
             output = Agent1Output(status="COMPLETED", risk=risk, next_action="HANDOFF_DOCTOR",
                 response_text="Đã ghi nhận yêu cầu gặp bác sĩ của bạn; chưa có xác nhận bác sĩ tiếp nhận.")
+        elif danger_pending and (state["extraction_failed"] or risk.assessment_status == "FAILED"):
+            response = f"{DANGER_WARNING}\n\nMình chưa xử lý được đầy đủ tin nhắn này. Bạn có thể gửi lại hoặc bổ sung thông tin trong lúc chờ bác sĩ."
+            output = Agent1Output(status="COMPLETED", risk=risk, next_action="CONTINUE_AI",
+                response_text=response, risk_warning=DANGER_WARNING)
         elif state["extraction_failed"] or risk.assessment_status == "FAILED":
             error = state["extraction_error"] if state["extraction_failed"] else risk.error
-            output = Agent1Output(status="FAILED", risk=risk, error=error or ProcessingError(
-                stage="routing", code="PROVIDER", message="Message processing failed", retryable=True))
-        elif rag and rag.status in {"UNAVAILABLE", "INSUFFICIENT", "FAILED"}:
+            if (state["extraction_failed"] and risk.assessment_status == "ASSESSED"
+                    and risk.result == "SAFE" and error
+                    and "fact_source_not_current_message_or_exact_excerpt" in error.message):
+                response = ("Mình chưa thể xác nhận chính xác một phần thông tin bạn gửi nên chưa cập nhật phần đó. "
+                            "Bạn vui lòng diễn đạt lại thông tin bằng câu ngắn hơn để mình tiếp tục nhé.")
+                output = Agent1Output(status="COMPLETED", risk=risk, next_action="ASK_MORE",
+                                      response_text=response)
+                conversation.messages.append(Message(message_id=f"ai_{uuid4().hex}", role="AI",
+                    content=response, timestamp=max(message.timestamp, datetime.now(timezone.utc)),
+                    case_ids=message.case_ids))
+            else:
+                output = Agent1Output(status="FAILED", risk=risk, error=error or ProcessingError(
+                    stage="routing", code="PROVIDER", message="Message processing failed", retryable=True))
+        elif rag and rag.status in {"UNAVAILABLE", "INSUFFICIENT", "FAILED"} and not doctor_pending:
             output = Agent1Output(status="COMPLETED", risk=risk, next_action="HANDOFF_DOCTOR",
                 response_text="Tài liệu hiện có chưa đủ để tiếp tục thu thập thông tin chuyên môn. Đã ghi nhận yêu cầu bác sĩ xem xét; chưa có xác nhận tiếp nhận.")
         else:
             intake = evaluate_requirements(clinical, facts=session.facts, conflicts=session.conflicts, risk=risk,
-                case_uncertain=bound is None, additional=rag.requirements if rag_ready else ())
+                case_uncertain=bound is None, additional=rag.requirements if rag_ready else (),
+                doctor_handoff_pending=doctor_pending)
             conversation.clinical_state = intake.state
             try:
                 if intake.status in {"ASK_MORE", "CLARIFY_CASE", "CLARIFY_CONFLICT"}:
-                    output = _ask(session, intake, risk, extracted.case_result, question_json)
+                    output = _ask(session, intake, risk, extracted.case_result, question_json,
+                                  source_rejected=extracted.source_rejected_count > 0,
+                                  danger_warning=DANGER_WARNING if danger_pending else None)
                 elif intake.status == "HANDOFF_DOCTOR":
                     output = Agent1Output(status="COMPLETED", risk=risk, next_action="HANDOFF_DOCTOR",
                         response_text="Có dấu hiệu nguy hiểm cần bác sĩ xem xét. Đã ghi nhận yêu cầu chuyển bác sĩ; chưa có xác nhận tiếp nhận.")
+                elif intake.status == "READY_FOR_REVIEW" and extracted.source_rejected_count:
+                    response = ("Mình đã ghi nhận phần thông tin xác thực được; một số chi tiết chưa được cập nhật. "
+                                "Bạn vui lòng diễn đạt lại phần đó để mình hoàn tất thu thập nhé.")
+                    output = Agent1Output(status="COMPLETED", risk=risk, next_action="ASK_MORE",
+                                          response_text=response)
+                    conversation.messages.append(Message(message_id=f"ai_{uuid4().hex}", role="AI",
+                        content=response, timestamp=max(message.timestamp, datetime.now(timezone.utc)),
+                        case_ids=message.case_ids))
+                elif intake.status == "READY_FOR_REVIEW" and doctor_pending:
+                    response = (f"{DANGER_WARNING}\n\n" if danger_pending else "") + (
+                        "Mình đã ghi nhận thông tin bổ sung. Hội thoại vẫn đang chờ bác sĩ tiếp nhận.")
+                    output = Agent1Output(status="COMPLETED", risk=risk, next_action="CONTINUE_AI",
+                        response_text=response, risk_warning=DANGER_WARNING if danger_pending else None)
                 elif intake.status == "READY_FOR_REVIEW":
                     output = Agent1Output(status="COMPLETED", risk=risk, chief_complaint_known=bool(bound.chief_complaint),
                         case_result=CaseResolution(resolution="OLD_CASE", target_case_id=bound.case_id),
@@ -244,7 +289,9 @@ def build_intake_graph(*, extract_json: Callable | None = None,
             if current and bound:
                 current.workflow.status = "WAITING_DOCTOR"
                 current.workflow.next_action = output.next_action
-        if output.next_action in {"HANDOFF_DOCTOR", "EMERGENCY", "PASS_TO_AGENT_2"} and output.response_text:
+        elif doctor_pending and case:
+            case.workflow.status = "WAITING_DOCTOR"
+        if output.next_action in {"HANDOFF_DOCTOR", "EMERGENCY", "PASS_TO_AGENT_2", "CONTINUE_AI"} and output.response_text:
             conversation.messages.append(Message(message_id=f"ai_{uuid4().hex}", role="AI",
                 content=output.response_text, timestamp=max(message.timestamp, datetime.now(timezone.utc)),
                 case_ids=[bound.case_id] if bound else []))
@@ -254,15 +301,18 @@ def build_intake_graph(*, extract_json: Callable | None = None,
     def retrieve_evidence(state):
         case = next((c for c in state["session"].conversation.clinical_state.cases
                      if c.case_id == state.get("bound_case_id")), None)
+        saved_risk = (state["session"].risk_by_case.get(case.case_id) if case else None)
+        danger_pending = bool((saved_risk and saved_risk.result == "DANGEROUS")
+                              or state["session"].unbound_risk and state["session"].unbound_risk.result == "DANGEROUS")
         reason = ("extraction_failed" if state["extraction_failed"] else
                   "risk_failed" if state["risk"].assessment_status == "FAILED" else
                   "case_unbound" if case is None else
-                  "doctor_mode" if case.response_mode == "DOCTOR_ACTIVE" or case.workflow.status == "WAITING_DOCTOR" else None)
+                  "doctor_mode" if case.response_mode == "DOCTOR_ACTIVE" else None)
         if reason:
             return {"rag": None, "rag_skip_reason": reason}
         # Retrieve only for a concrete specialist question need, not to certify SAFE.
         # Danger and explicit doctor requests route directly without delaying on RAG.
-        if state["risk"].result == "DANGEROUS" or (state["screening"] and state["screening"].doctor_request):
+        if danger_pending or state["risk"].result == "DANGEROUS" or (state["screening"] and state["screening"].doctor_request):
             return {"rag": None, "rag_skip_reason": "direct_escalation"}
         requested = state["rag_required"] or bool(
             state["screening"] and state["screening"].needs_external_evidence)

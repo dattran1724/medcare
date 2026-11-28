@@ -57,6 +57,10 @@ INTAKE_FIELD_GUIDANCE = {
     "present_illness.episode_duration": "Length of each episode, e.g. 'mỗi lần vài phút'.",
     "present_illness.frequency": "How often episodes occur, e.g. 'thỉnh thoảng', 'ba lần mỗi ngày'.",
     "present_illness.course": "Change over time, e.g. 'không thay đổi', 'nặng dần'; not intermittent frequency.",
+    "present_illness.location": "Where the main symptom is felt; ask about radiation separately only when relevant.",
+    "present_illness.associated_symptoms": "Other symptoms occurring with the main complaint; accept an explicit denial as ABSENT.",
+    "present_illness.aggravating_factors": "What makes the symptom worse; accept an explicit denial as ABSENT.",
+    "present_illness.relieving_factors": "What makes the symptom better; accept an explicit denial as ABSENT.",
 }
 
 

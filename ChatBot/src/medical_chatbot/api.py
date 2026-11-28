@@ -57,9 +57,29 @@ def create_app(graph=None, *, database_path: str | None = None, storage=None) ->
             raise HTTPException(404, "Conversation not found")
         return IntakeSession.model_validate(data)
 
-    def save_result(conversation_id, key, content, result):
+    def save_result(conversation_id, key, content, result, previous=None):
         store.put("sessions", conversation_id, result.session.model_dump(mode="json"))
         store.put("replies", key, {"content": content, "result": result.model_dump(mode="json")})
+        if result.output.next_action not in {"HANDOFF_DOCTOR", "EMERGENCY"}:
+            return
+        request_message = next((m for m in result.session.conversation.messages
+                                if m.message_id == key[1]), None)
+        if not request_message or not request_message.case_ids:
+            return
+        case_id = request_message.case_ids[-1]
+        old_case = next((c for c in previous.conversation.clinical_state.cases
+                         if c.case_id == case_id), None) if previous else None
+        if old_case and old_case.workflow.status == "WAITING_DOCTOR":
+            return
+        store.put("doctor_notifications", (conversation_id, case_id, key[1]), {
+            "conversation_id": conversation_id,
+            "case_id": case_id,
+            "message_id": key[1],
+            "patient_id": result.session.conversation.patient_id,
+            "reason": "DANGER" if result.output.risk.result == "DANGEROUS" else "USER_REQUEST",
+            "status": "PENDING",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
 
     @app.get("/health")
     def health():
@@ -96,7 +116,7 @@ def create_app(graph=None, *, database_path: str | None = None, storage=None) ->
             except Exception:
                 # Do not expose request payloads, model exceptions or secrets.
                 raise HTTPException(503, "Agent processing failed; state was not committed") from None
-            save_result(conversation_id, key, body.content, result)
+            save_result(conversation_id, key, body.content, result, current)
             if result.processing_errors:
                 store.put("before_turns", key, current.model_dump(mode="json"))
             return result
@@ -149,7 +169,7 @@ def create_app(graph=None, *, database_path: str | None = None, storage=None) ->
                 raise HTTPException(409, "Retry no longer matches the conversation state") from None
             except Exception:
                 raise HTTPException(503, "Retry failed; state was not committed") from None
-            save_result(conversation_id, key, original_reply["content"], result)
+            save_result(conversation_id, key, original_reply["content"], result, current)
             store.put("retry_replies", retry_key, result.model_dump(mode="json"))
             store.put("retry_counts", key, attempts + 1)
             return result

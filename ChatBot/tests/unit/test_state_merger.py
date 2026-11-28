@@ -14,6 +14,7 @@ from medical_chatbot.requirements.engine import evaluate_requirements, record_un
 from medical_chatbot.schemas.facts import Fact
 from medical_chatbot.schemas.requirements import Requirement
 from medical_chatbot.schemas.risk import RiskResult
+from medical_chatbot.requirements.satisfaction import CORE_FIELDS
 
 
 def run(state=None, text="headache for two days", field="present_illness.duration",
@@ -279,6 +280,17 @@ def intake_state(complete=False):
         case.present_illness.onset = "yesterday"
         case.present_illness.duration = "one day"
         case.present_illness.course = "unchanged"
+        case.present_illness.location = "forehead"
+        for key, target in (
+            ("associated_symptoms", "present_illness.associated_symptoms"),
+            ("aggravating_factors", "present_illness.aggravating_factors"),
+            ("relieving_factors", "present_illness.relieving_factors"),
+        ):
+            case.missing_information.append(Requirement(
+                key=key, target=target, target_case_id="c1", priority="HIGH",
+                source="CORE", reason="Explicitly unable to provide in test", blocking=True,
+                status="UNKNOWN",
+            ))
     return ClinicalState(current_case_id="c1", cases=[case])
 
 
@@ -294,6 +306,12 @@ def symptom_fact(key="fever", status="ABSENT", value=None, case_id="c1"):
         source=dict(message_id="m", source_text="No fever"))
 
 
+def test_character_and_severity_are_not_core_intake_requirements():
+    assert "character" not in CORE_FIELDS
+    assert "severity" not in CORE_FIELDS
+    assert {"location", "associated_symptoms", "aggravating_factors", "relieving_factors"} <= CORE_FIELDS.keys()
+
+
 def test_engine_partial_answers_clarifies_missing_items_without_handoff():
     state = intake_state()
     first = evaluate_requirements(state)
@@ -302,13 +320,16 @@ def test_engine_partial_answers_clarifies_missing_items_without_handoff():
     first = mark_question_sent(first, "Test question")
     first.state.cases[0].present_illness.onset = "yesterday"
     second = evaluate_requirements(first.state)
-    assert [r.key for r in second.selected] == ["course"]
+    assert [r.key for r in second.selected] == ["duration"]
     second = mark_question_sent(second, "Test question")
     third = evaluate_requirements(second.state)
     assert third.status == "ASK_MORE"
-    assert {r.key for r in third.selected} == {"duration", "course"}
+    assert {r.key for r in third.selected} == {"duration"}
     assert third.question is None
-    assert {r.key for r in third.state.cases[0].missing_information} == {"duration", "course"}
+    assert {r.key for r in third.state.cases[0].missing_information} == {
+        "duration", "course", "location", "associated_symptoms",
+        "aggravating_factors", "relieving_factors",
+    }
 
 
 def test_critical_tier_blocks_high_even_when_already_asked():
@@ -524,7 +545,7 @@ def test_gemini_sdk_request_configuration_and_client_cleanup(monkeypatch):
     monkeypatch.setenv("GEMINI_TIMEOUT_MS", "10000")
     assert gemini_generate({"approved_scopes": []})
     assert captured["client"]["http_options"] == {"timeout": 10000, "retry_options": {
-        "attempts": 2, "initial_delay": 1.0, "max_delay": 2.0,
+        "attempts": 3, "initial_delay": 1.0, "max_delay": 4.0,
         "http_status_codes": [500, 502, 503, 504]}}
     assert captured["request"]["model"] == "test-model"
     assert captured["request"]["config"]["response_mime_type"] == "application/json"
@@ -641,6 +662,32 @@ def test_extraction_schema_has_no_recursive_json_value_reference():
     assert "facts" in schema["properties"]
     assert "patient_facts" not in schema["properties"]
     assert "case_facts" not in schema["properties"]
+    assert "value" in schema["$defs"]["ExtractedFact"]["required"]
+
+
+def test_invalid_present_fact_is_omitted_after_one_corrective_extraction(monkeypatch):
+    from medical_chatbot.agents.intake import input_processor
+    conversation, message = extraction_context()
+    data = extracted_duration()
+    invalid = dict(field="present_illness.onset", key="onset", value=None, status="PRESENT",
+                   source={"message_id": "u1", "source_text": "two days"})
+    data["facts"] = [invalid, data.pop("case_facts")[0]]
+    calls = []
+
+    def provider(payload, *, system_instruction, response_schema):
+        calls.append(system_instruction)
+        return json.dumps(data)
+
+    monkeypatch.setattr(input_processor, "gemini_generate", provider)
+    result = process_input(conversation, message)
+
+    assert len(calls) == 2
+    assert "previous response failed schema validation" in calls[1]
+    assert [fact.field.value for fact in result.case_facts] == ["present_illness.duration"]
+    assert result.case_facts[0].value == "two days"
+    merged = update_clinical_state(conversation.clinical_state, message, result)
+    assert merged.state.cases[0].present_illness.onset is None
+    assert evaluate_requirements(merged.state, facts=merged.facts).status == "ASK_MORE"
 
 
 def test_real_provider_scope_failure_is_classified_by_code(monkeypatch):
@@ -686,6 +733,31 @@ def test_flat_extraction_still_rejects_invalid_sources_and_rag_flags():
     with pytest.raises(InputProcessingError) as caught:
         process_input(conversation, message, generate_json=lambda _: json.dumps(data))
     assert "response: rag_reason_mismatch" in str(caught.value)
+
+
+def test_bad_source_in_one_fact_keeps_other_verified_facts(monkeypatch):
+    import medical_chatbot.agents.intake.input_processor as input_processor
+
+    conversation, message = extraction_context()
+    message.content = "two days and fever"
+    data = {
+        "case_result": {"resolution": "OLD_CASE", "target_case_id": "c1"},
+        "facts": [
+            {"field": "present_illness.duration", "key": "duration", "value": "two days",
+             "status": "PRESENT", "source": {"message_id": "u1", "source_text": "two days"}},
+            {"field": "present_illness.associated_symptoms", "key": "fever", "value": "fever",
+             "status": "PRESENT", "source": {"message_id": "u1", "source_text": "invented"}},
+        ],
+    }
+    calls = []
+    monkeypatch.setattr(input_processor, "gemini_generate",
+                        lambda *args, **kwargs: calls.append(kwargs) or json.dumps(data))
+
+    result = input_processor.process_input(conversation, message)
+
+    assert len(calls) == 2
+    assert [fact.value for fact in result.case_facts] == ["two days"]
+    assert result.source_rejected_count == 1
 
 
 def test_mixed_wire_formats_are_rejected():

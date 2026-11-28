@@ -1,7 +1,8 @@
 """Gemini proposes facts; code validates message provenance and case ownership."""
 from collections.abc import Callable, Sequence
+import json
 
-from pydantic import Field, StrictFloat, StrictInt, model_validator
+from pydantic import Field, StrictFloat, StrictInt, ValidationError, model_validator
 
 from medical_chatbot.schemas.conversation import Conversation, Message
 from medical_chatbot.schemas.facts import FactField, INTAKE_FIELD_GUIDANCE
@@ -23,7 +24,7 @@ class InputProcessingError(RuntimeError):
 
 class ExtractedFact(FactProposal):
     # Flat values match the current merger and avoid recursive JSON schemas.
-    value: str | StrictInt | StrictFloat | None = None
+    value: str | StrictInt | StrictFloat | None
 
 
 class ExtractionOutput(Schema):
@@ -66,11 +67,49 @@ class ExtractionOutput(Schema):
         })
 
 
+def _missing_present_fact_indexes(error: ValidationError) -> set[int] | None:
+    indexes = set()
+    for item in error.errors():
+        location = item["loc"]
+        if item["type"] == "present_fact_missing_value" and len(location) >= 2 and location[0] == "facts":
+            indexes.add(location[1])
+        elif (item["type"] == "missing" and len(location) >= 3
+              and location[0] == "facts" and location[-1] == "value"):
+            indexes.add(location[1])
+        else:
+            return None
+    return indexes or None
+
+
+def _has_invalid_source(result: InputProcessorOutput, message: Message) -> bool:
+    items = result.patient_facts + result.case_facts + result.unavailable_answers
+    return any(item.source.message_id != message.message_id
+               or item.source.source_text not in message.content for item in items)
+
+
+def _discard_invalid_sources(result: InputProcessorOutput, message: Message) -> InputProcessorOutput:
+    def valid(item):
+        return (item.source.message_id == message.message_id
+                and item.source.source_text in message.content)
+
+    items = result.patient_facts + result.case_facts + result.unavailable_answers
+    rejected = sum(not valid(item) for item in items)
+    return result.model_copy(update={
+        "patient_facts": [item for item in result.patient_facts if valid(item)],
+        "case_facts": [item for item in result.case_facts if valid(item)],
+        "unavailable_answers": [item for item in result.unavailable_answers if valid(item)],
+        "source_rejected_count": rejected,
+    })
+
+
 EXTRACTION_INSTRUCTION = """You are a medical intake information extractor, not a doctor.
-Interpret only the new USER message using state, recent history and the last AI
-question with its asked_requirements. History is context, not new patient evidence.
-One response can answer multiple requirements, answer only part, change topic or
-provide unrelated patient information. Do not force it into the last question.
+Interpret the new USER message independently from the last AI question. First
+extract every explicit patient fact in the new message that matches an allowed
+field; then separately determine which asked requirements it answers. One message
+can answer multiple requirements, answer only part, change topic or provide
+unrelated patient information. Keep unrelated facts and leave unanswered
+requirements missing; never force all content into the last question. History is
+context, not new patient evidence.
 If ambiguous, use UNCERTAIN case resolution/status; never guess a case or a value.
 For OLD_CASE use an existing supplied case ID, including a resolved case if relevant.
 For NEW_CASE, new_problem must be a verbatim excerpt of the new message, not a
@@ -79,8 +118,9 @@ Every fact source must reference the new message ID and an exact nonempty excerp
 Return all extracted items in the single facts list. Code assigns patient/case
 scope from field paths. Do not return patient_facts or case_facts.
 Do not copy doctor conclusions as user facts. Do not infer age, severity scores,
-units or absent symptoms. PRESENT requires a value; ABSENT uses value=null and a
-key naming the denied item; UNCERTAIN can use null. No mention is not denial.
+units or absent symptoms. Every fact must include the value field. PRESENT requires
+a non-null value; ABSENT uses value=null and a key naming the denied item; UNCERTAIN
+can use null. No mention is not denial.
 Use allowed field paths only; one item per list fact, one key/value per vital.
 For scalar fields, key is the field's final path component (e.g. duration/onset).
 Use field_guidance consistently. Never replace onset with duration. A message can
@@ -90,11 +130,17 @@ Each-episode length belongs in episode_duration. If the overall duration remains
 unknown, ask for it; do not overwrite it with episode_duration.
 For list items use consistent semantic keys from asked requirements or prior state
 context (e.g. fever), not a new spelling for the same item.
+For an explicit denial of an entire intake list, use its canonical field key
+(associated_symptoms, aggravating_factors or relieving_factors). For one denied
+item, use that item's key instead.
 change_type belongs to each fact. Only mark CORRECTION or TEMPORAL_CHANGE with
 explicit evidence; include the wording expressing the change in source_text.
 Unknown/refused/unavailable answers go in unavailable_answers only when explicitly
 linked to a supplied asked requirement. Do not mark unanswered parts as refused.
 Do not also emit a fact for the same unavailable answer.
+When the new USER message explicitly says they do not know the answer to the
+single requirement in last_question.asked_requirements, return that requirement
+in unavailable_answers with status UNKNOWN instead of an UNCERTAIN fact.
 Do not set risk, workflow, fact/case IDs, modes, diagnoses or treatment recommendations.
 Copy message_id exactly into each source; OLD_CASE must copy an existing target_case_id.
 Set need_medical_rag only when specialist knowledge is needed to decide what to
@@ -140,12 +186,75 @@ def process_input(
     }
     validating = False
     try:
-        raw = generate_json(payload) if generate_json else gemini_generate(
-            payload, system_instruction=EXTRACTION_INSTRUCTION,
-            response_schema=ExtractionOutput.model_json_schema())
+        response_schema = ExtractionOutput.model_json_schema()
+        if generate_json:
+            raw = generate_json(payload)
+        else:
+            raw = gemini_generate(payload, system_instruction=EXTRACTION_INSTRUCTION,
+                                  response_schema=response_schema)
         validating = True
-        extracted = ExtractionOutput.model_validate_json(raw)
+        try:
+            extracted = ExtractionOutput.model_validate_json(raw)
+        except ValidationError:
+            if generate_json:
+                raise
+            correction = (EXTRACTION_INSTRUCTION + "\nThe previous response failed schema validation. "
+                         "Return a corrected complete response. Every PRESENT fact must have a clear, "
+                         "non-null value stated in the new message; otherwise omit it or mark it UNCERTAIN. "
+                         "Every fact must include the value field; use null only for ABSENT or UNCERTAIN. "
+                         "Do not guess or invent a value.")
+            raw = gemini_generate(payload, system_instruction=correction, response_schema=response_schema)
+            try:
+                extracted = ExtractionOutput.model_validate_json(raw)
+            except ValidationError as retry_error:
+                # A malformed optional fact must not discard the other valid facts
+                # from the message. Drop only PRESENT facts with no value.
+                data = json.loads(raw)
+                indexes = _missing_present_fact_indexes(retry_error)
+                facts = data.get("facts") if isinstance(data, dict) else None
+                if (indexes is None or not isinstance(facts, list)
+                        or any(index >= len(facts) or not isinstance(facts[index], dict)
+                               or facts[index].get("status") != "PRESENT" for index in indexes)):
+                    raise
+                data["facts"] = [fact for index, fact in enumerate(facts)
+                                 if index not in indexes]
+                extracted = ExtractionOutput.model_validate(data)
         result = extracted.to_internal()
+        if _has_invalid_source(result, message) and generate_json is None:
+            original_result = result
+            correction = (EXTRACTION_INSTRUCTION + "\nThe previous JSON included a source excerpt "
+                         "that was not copied exactly from the new user message. Return the complete "
+                         "corrected JSON. For every fact, copy source_text verbatim from the new "
+                         "message and preserve its exact message_id. Omit any fact that cannot be "
+                         "supported by an exact excerpt; do not paraphrase or infer.")
+            try:
+                repair_payload = {**payload, "previous_response": raw}
+                raw = gemini_generate(repair_payload, system_instruction=correction,
+                                      response_schema=response_schema)
+                extracted = ExtractionOutput.model_validate_json(raw)
+                result = extracted.to_internal()
+            except Exception:
+                result = original_result
+            if _has_invalid_source(result, message):
+                result = _discard_invalid_sources(result, message)
+        # A direct "I don't know" to one unambiguous question is an answer, not
+        # a new fact to leave pending and ask repeatedly.
+        asked_requirements = last_question.asked_requirements if last_question else []
+        unknown_reply = any(phrase in message.content.casefold()
+                            for phrase in ("chưa rõ", "không rõ", "không biết"))
+        if (unknown_reply and len(asked_requirements) == 1 and not result.unavailable_answers
+                and result.case_result.resolution == "OLD_CASE"
+                and result.case_result.target_case_id == asked_requirements[0].target_case_id):
+            requirement = asked_requirements[0]
+            identity = (requirement.target_case_id, requirement.key)
+            result.case_facts = [fact for fact in result.case_facts
+                                 if (fact.target_case_id, fact.key) != identity]
+            result.patient_facts = [fact for fact in result.patient_facts
+                                    if (fact.target_case_id, fact.key) != identity]
+            result.unavailable_answers.append(UnavailableAnswer(
+                key=requirement.key, target_case_id=requirement.target_case_id,
+                status="UNKNOWN", source={"message_id": message.message_id,
+                                          "source_text": message.content}))
         resolution = result.case_result
         cases = {c.case_id for c in conversation.clinical_state.cases}
         if resolution.resolution == "OLD_CASE" and resolution.target_case_id not in cases:
